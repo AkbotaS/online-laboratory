@@ -6,9 +6,15 @@ import { handleAssistantRequest, handleMentorEvent } from './assistant-api.mjs';
 import { LearningAnalyticsStore, createSessionToken, hashSessionToken } from './learning-analytics-store.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
-const host = process.env.HOST || '127.0.0.1';
-const port = Number(process.env.PORT || 4173);
-const store = new LearningAnalyticsStore(root, process.env.ONLINE_LAB_DATA_DIR ? resolve(process.env.ONLINE_LAB_DATA_DIR) : '');
+const configuredPort = String(process.env.PORT || '').trim();
+const port = configuredPort ? Number(configuredPort) : 4173;
+if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('PORT must be a valid TCP port number.');
+const isHostedRuntime = Boolean(configuredPort) || String(process.env.RENDER || '').toLowerCase() === 'true';
+const host = isHostedRuntime ? '0.0.0.0' : (String(process.env.HOST || '').trim() || '127.0.0.1');
+const dataDirectory = process.env.ONLINE_LAB_DATA_DIR
+  ? resolve(process.env.ONLINE_LAB_DATA_DIR)
+  : (isHostedRuntime ? '/var/data' : '');
+const store = new LearningAnalyticsStore(root, dataDirectory);
 const sessions = new Map();
 const loginWindows = new Map();
 const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon' };
@@ -216,6 +222,7 @@ const server = createServer(async (request, response) => {
       return sendJson(response, 404, { error: 'API бағыты табылмады.' }, cors);
     } catch (error) {
       const status = Number.isInteger(error.status) ? error.status : 500;
+      if (status >= 500) console.error('API request failed:', request.method, url.pathname, error?.name || 'Error');
       const message = status >= 500 ? 'Сұрауды өңдеу мүмкін болмады.' : error.message;
       return sendJson(response, status, { error: message }, cors);
     }
@@ -237,5 +244,24 @@ const server = createServer(async (request, response) => {
 });
 
 await store.ready;
-const adminConfigured = await store.ensureAdmin(process.env.ADMIN_USERNAME || '', process.env.ADMIN_PASSWORD || '');
-server.listen(port, host, () => console.log('Online Laboratory: http://' + host + ':' + port + ' (AI ' + (process.env.OPENAI_API_KEY ? 'configured' : 'not configured') + ', admin ' + (adminConfigured ? 'configured' : 'not configured') + ')'));
+const adminUsername = String(process.env.ADMIN_USERNAME || '').trim();
+const adminPassword = String(process.env.ADMIN_PASSWORD || '');
+const adminProvisioned = await store.ensureAdmin(adminUsername, adminPassword);
+const adminConfigured = store.hasAdmin();
+if (!adminProvisioned) {
+  const issues = [];
+  if (!USERNAME_RE.test(adminUsername)) issues.push('ADMIN_USERNAME must be 3–40 ASCII letters, digits, dots, hyphens, or underscores');
+  if (adminPassword.length < 12) issues.push('ADMIN_PASSWORD must contain at least 12 characters');
+  console.warn('Admin environment credentials were not applied. ' + issues.join('; ') + '. Credential values are never logged.');
+}
+server.on('error', error => {
+  console.error('HTTP server failed to listen:', error?.code || 'SERVER_ERROR');
+  process.exitCode = 1;
+});
+server.listen(port, host, () => {
+  const address = server.address();
+  const listeningPort = address && typeof address === 'object' ? address.port : port;
+  console.log('Online Laboratory listening on ' + host + ':' + listeningPort);
+  console.log('Optional AI mentor: ' + (process.env.OPENAI_API_KEY ? 'configured' : 'disabled (OPENAI_API_KEY is optional)'));
+  console.log('Administrator account: ' + (adminConfigured ? 'ready' : 'not configured'));
+});

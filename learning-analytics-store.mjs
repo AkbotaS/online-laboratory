@@ -66,6 +66,7 @@ function matchesAnswer(value, choices = []) { const selected = normalizeAnswer(v
 
 export class LearningAnalyticsStore {
   constructor(projectRoot, dataDirectory = '') {
+    this.projectRoot = projectRoot;
     this.directory = dataDirectory ? join(dataDirectory, 'learning-analytics') : join(projectRoot, 'data', 'learning-analytics');
     this.usersFile = join(this.directory, 'users.json');
     this.settingsFile = join(this.directory, 'settings.json');
@@ -95,8 +96,21 @@ export class LearningAnalyticsStore {
     } catch { /* first run uses the documented 100-point rubric */ }
     try {
       const loaded = JSON.parse(await readFile(this.curriculumFile, 'utf8'));
-      if (Array.isArray(loaded?.labs) && Array.isArray(loaded?.quizzes)) this.curriculum = { revision: Number(loaded.revision) || 1, updatedAt: loaded.updatedAt || '', labs: loaded.labs, quizzes: loaded.quizzes, assistantConfig: loaded.assistantConfig || null };
-    } catch { /* first run uses the browser's local project data until an admin syncs it */ }
+      if (!Array.isArray(loaded?.labs) || !Array.isArray(loaded?.quizzes)) throw new Error('Stored curriculum has an invalid format.');
+      this.curriculum = { revision: Number(loaded.revision) || 1, updatedAt: loaded.updatedAt || '', labs: loaded.labs, quizzes: loaded.quizzes, assistantConfig: loaded.assistantConfig || null };
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw new Error('Existing curriculum could not be read; it was left untouched.', { cause: error });
+      try {
+        const seeded = JSON.parse(await readFile(join(this.projectRoot, 'seed', 'curriculum.json'), 'utf8'));
+        if (!Array.isArray(seeded?.labs) || !Array.isArray(seeded?.quizzes)) throw new Error('Seed curriculum has an invalid format.');
+        this.curriculum = { revision: Number(seeded.revision) || 1, updatedAt: seeded.updatedAt || '', labs: seeded.labs, quizzes: seeded.quizzes, assistantConfig: seeded.assistantConfig || null };
+        const temp = this.curriculumFile + '.seed-' + randomUUID() + '.tmp';
+        await writeFile(temp, JSON.stringify(this.curriculum), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+        await rename(temp, this.curriculumFile);
+      } catch (seedError) {
+        if (seedError?.code !== 'ENOENT') throw new Error('Initial curriculum could not be loaded; no existing data was replaced.', { cause: seedError });
+      }
+    }
     for (const [file, target] of [[this.eventsFile, this.events], [this.measuresFile, this.measures]]) {
       try {
         const contents = await readFile(file, 'utf8');
