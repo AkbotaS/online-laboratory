@@ -1,0 +1,241 @@
+import { createServer } from 'node:http';
+import { readFile, stat } from 'node:fs/promises';
+import { dirname, extname, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { handleAssistantRequest, handleMentorEvent } from './assistant-api.mjs';
+import { LearningAnalyticsStore, createSessionToken, hashSessionToken } from './learning-analytics-store.mjs';
+
+const root = dirname(fileURLToPath(import.meta.url));
+const host = process.env.HOST || '127.0.0.1';
+const port = Number(process.env.PORT || 4173);
+const store = new LearningAnalyticsStore(root, process.env.ONLINE_LAB_DATA_DIR ? resolve(process.env.ONLINE_LAB_DATA_DIR) : '');
+const sessions = new Map();
+const loginWindows = new Map();
+const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon' };
+const SESSION_MS = 8 * 60 * 60 * 1000;
+const USERNAME_RE = /^[a-zA-Z0-9._-]{3,40}$/;
+
+function sendJson(response, status, data, headers = {}) { response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...headers }); response.end(JSON.stringify(data)); }
+function localCorsHeaders(request) {
+  const origin = request.headers.origin;
+  if (!origin) return {};
+  const configured = String(process.env.ALLOWED_ORIGINS || '').split(',').map(value => value.trim()).filter(Boolean);
+  const allowed = new Set(['http://127.0.0.1:' + port, 'http://localhost:' + port, ...configured]);
+  const forwardedHost = String(request.headers['x-forwarded-host'] || request.headers.host || '').split(',')[0].trim();
+  const forwardedProto = String(request.headers['x-forwarded-proto'] || (request.socket.encrypted ? 'https' : 'http')).split(',')[0].trim();
+  try {
+    const parsedOrigin = new URL(origin);
+    if (parsedOrigin.host === forwardedHost && parsedOrigin.protocol === forwardedProto + ':') allowed.add(origin);
+  } catch {}
+  if (!allowed.has(origin)) return {};
+  return { 'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Credentials': 'true', 'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Max-Age': '600', 'Vary': 'Origin' };
+}
+function originAllowed(request) { return !request.headers.origin || Object.keys(localCorsHeaders(request)).length > 0; }
+function parseCookies(header = '') {
+  return Object.fromEntries(header.split(';').map(part => part.trim()).filter(Boolean).map(part => {
+    const index = part.indexOf('=');
+    return index < 0 ? [part, ''] : [part.slice(0, index), decodeURIComponent(part.slice(index + 1))];
+  }));
+}
+function sessionCookie(request, token, maxAge) {
+  const secure = request.headers['x-forwarded-proto'] === 'https' || Boolean(request.socket.encrypted);
+  return 'lab_session=' + encodeURIComponent(token || '') + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=' + maxAge + (secure ? '; Secure' : '');
+}
+function getSessionUser(request) {
+  const token = parseCookies(request.headers.cookie).lab_session;
+  if (!token) return null;
+  const key = hashSessionToken(token), session = sessions.get(key);
+  if (!session || session.expiresAt <= Date.now()) { sessions.delete(key); return null; }
+  const user = store.getUser(session.userId);
+  if (!user) { sessions.delete(key); return null; }
+  return { ...user, sessionKey: key };
+}
+function revokeUserSessions(userId) { for (const [key, session] of sessions) if (session.userId === userId) sessions.delete(key); }
+function loginRateLimited(request) {
+  const ip = request.socket.remoteAddress || 'local';
+  const now = Date.now(), entry = loginWindows.get(ip) || { start: now, count: 0 };
+  if (now - entry.start > 60_000) { entry.start = now; entry.count = 0; }
+  entry.count += 1; loginWindows.set(ip, entry);
+  if (loginWindows.size > 1000) for (const [key, value] of loginWindows) if (now - value.start > 60_000) loginWindows.delete(key);
+  return entry.count > 12;
+}
+async function readRequest(request, maxBytes = 32_000) {
+  const chunks = []; let size = 0;
+  for await (const chunk of request) { size += chunk.length; if (size > maxBytes) throw Object.assign(new Error('BODY_TOO_LARGE'), { status: 413 }); chunks.push(chunk); }
+  if (!size) return {};
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+  catch { throw Object.assign(new Error('INVALID_JSON'), { status: 400 }); }
+}
+function requireUser(request, response, adminOnly = false) {
+  const user = getSessionUser(request);
+  if (!user) { sendJson(response, 401, { error: 'Сессия не найдена. Войдите снова.' }, localCorsHeaders(request)); return null; }
+  if (user.mustChangePassword) { sendJson(response, 428, { error: 'Перед продолжением смените временный пароль.' }, localCorsHeaders(request)); return null; }
+  if (adminOnly && user.role !== 'admin') { sendJson(response, 403, { error: 'Бұл әрекетке әкімші құқығы қажет.' }, localCorsHeaders(request)); return null; }
+  return user;
+}
+function removeSessionCookie(request) { return { 'Set-Cookie': sessionCookie(request, '', 0) }; }
+
+const server = createServer(async (request, response) => {
+  const url = new URL(request.url || '/', 'http://' + (request.headers.host || '127.0.0.1'));
+  if (url.pathname.startsWith('/api/')) {
+    const cors = localCorsHeaders(request);
+    if (!originAllowed(request)) return sendJson(response, 403, { error: 'Origin рұқсат етілмеген.' });
+    if (request.method === 'OPTIONS') { response.writeHead(204, cors); return response.end(); }
+    try {
+      if (url.pathname === '/api/health' && request.method === 'GET') return sendJson(response, 200, { ok: true, aiConfigured: Boolean(process.env.OPENAI_API_KEY), adminConfigured: store.hasAdmin() }, cors);
+      if (url.pathname === '/api/auth/login' && request.method === 'POST') {
+        if (loginRateLimited(request)) return sendJson(response, 429, { error: 'Кіру әрекеттері жиілеп кетті. Бір минуттан соң қайталап көріңіз.' }, cors);
+        const body = await readRequest(request, 8_000);
+        const username = String(body.username || '').trim();
+        if (!USERNAME_RE.test(username) || !String(body.password || '').length) return sendJson(response, 400, { error: 'Логин мен құпиясөзді енгізіңіз.' }, cors);
+        const user = await store.authenticate(username, body.password);
+        if (!user) return sendJson(response, 401, { error: 'Логин немесе құпиясөз дұрыс емес.' }, cors);
+        const token = createSessionToken(), key = hashSessionToken(token);
+        sessions.set(key, { userId: user.id, expiresAt: Date.now() + SESSION_MS });
+        return sendJson(response, 200, { user }, { ...cors, 'Set-Cookie': sessionCookie(request, token, SESSION_MS / 1000) });
+      }
+      if (url.pathname === '/api/auth/me' && request.method === 'GET') {
+        const user = getSessionUser(request);
+        return user ? sendJson(response, 200, { user: { id: user.id, username: user.username, displayName: user.displayName, role: user.role, groupId: user.groupId, mustChangePassword: Boolean(user.mustChangePassword) } }, cors) : sendJson(response, 401, { error: 'Войти для продолжения нужно.' }, cors);
+      }
+      if (url.pathname === '/api/auth/change-password' && request.method === 'POST') {
+        const user = getSessionUser(request);
+        if (!user || user.role !== 'student') return sendJson(response, 401, { error: 'Сначала войдите как студент.' }, cors);
+        const body = await readRequest(request, 8_000);
+        const updated = await store.changeOwnPassword(user.id, body.password);
+        return sendJson(response, 200, { user: updated }, cors);
+      }
+      if (url.pathname === '/api/auth/logout' && request.method === 'POST') {
+        const user = getSessionUser(request);
+        if (user) sessions.delete(user.sessionKey);
+        return sendJson(response, 200, { ok: true }, { ...cors, ...removeSessionCookie(request) });
+      }
+      if (url.pathname === '/api/assistant' || url.pathname === '/api/mentor-event') {
+        if (request.method !== 'POST') return sendJson(response, 405, { error: 'POST қажет.' }, cors);
+        const user = requireUser(request, response);
+        if (!user) return;
+        const isMentor = url.pathname === '/api/mentor-event';
+        const raw = await readRequest(request, isMentor ? 900_000 : 40_000);
+        const apiRequest = new Request('http://' + (request.headers.host || '127.0.0.1') + url.pathname, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-forwarded-for': request.socket.remoteAddress || 'local' }, body: JSON.stringify(raw) });
+        const result = await (isMentor ? handleMentorEvent(apiRequest, process.env) : handleAssistantRequest(apiRequest, process.env));
+        response.writeHead(result.status, { ...Object.fromEntries(result.headers), ...cors }); response.end(Buffer.from(await result.arrayBuffer())); return;
+      }
+      if (url.pathname === '/api/learning/events' && request.method === 'POST') {
+        const user = requireUser(request, response);
+        if (!user) return;
+        const body = await readRequest(request, 256_000);
+        const batch = Array.isArray(body.events) ? body.events.slice(0, 50) : [body];
+        const results = [];
+        for (const event of batch) {
+          try { results.push({ eventId: event.eventId, ...(await store.appendEvent(user, event)) }); }
+          catch (error) { results.push({ eventId: event?.eventId || '', accepted: false, duplicate: false, rejected: true, reason: error.status ? error.message : 'Событие қабылданбады.' }); }
+        }
+        return sendJson(response, 200, { results, accepted: results.filter(item => item.accepted).length, duplicates: results.filter(item => item.duplicate).length, rejected: results.filter(item => item.rejected).length }, cors);
+      }
+      if (url.pathname === '/api/learning/grade' && request.method === 'POST') {
+        const user = requireUser(request, response);
+        if (!user) return;
+        return sendJson(response, 200, { result: store.gradeLab(user, await readRequest(request, 64_000)) }, cors);
+      }
+      if (url.pathname === '/api/learning/quiz-grade' && request.method === 'POST') {
+        const user = requireUser(request, response);
+        if (!user) return;
+        return sendJson(response, 200, { result: store.gradeQuiz(user, await readRequest(request, 64_000)) }, cors);
+      }
+      if (url.pathname === '/api/learning/me' && request.method === 'GET') {
+        const user = requireUser(request, response);
+        if (!user) return;
+        return sendJson(response, 200, store.queryAnalytics(user, { labId: url.searchParams.get('labId'), from: url.searchParams.get('from'), to: url.searchParams.get('to'), limit: url.searchParams.get('limit') }), cors);
+      }
+      if (url.pathname === '/api/learning/admin' && request.method === 'GET') {
+        const user = requireUser(request, response, true);
+        if (!user) return;
+        return sendJson(response, 200, store.queryAnalytics(user, {
+          studentId: url.searchParams.get('studentId'), groupId: url.searchParams.get('groupId'), labId: url.searchParams.get('labId'),
+          from: url.searchParams.get('from'), to: url.searchParams.get('to'), limit: url.searchParams.get('limit')
+        }), cors);
+      }
+      if (url.pathname === '/api/learning/settings' && request.method === 'GET') {
+        const user = requireUser(request, response);
+        if (!user) return;
+        return sendJson(response, 200, store.getSettings(), cors);
+      }
+      if (url.pathname === '/api/learning/settings' && request.method === 'PATCH') {
+        const user = requireUser(request, response, true);
+        if (!user) return;
+        return sendJson(response, 200, await store.setRubricWeights(user, await readRequest(request, 8_000)), cors);
+      }
+      if (url.pathname === '/api/curriculum' && request.method === 'GET') {
+        const user = requireUser(request, response);
+        if (!user) return;
+        return sendJson(response, 200, store.getCurriculum(user), cors);
+      }
+      if (url.pathname === '/api/curriculum/meta' && request.method === 'GET') {
+        const user = requireUser(request, response);
+        if (!user) return;
+        return sendJson(response, 200, store.getCurriculumMeta(), cors);
+      }
+      if (url.pathname === '/api/curriculum' && request.method === 'PUT') {
+        const user = requireUser(request, response, true);
+        if (!user) return;
+        return sendJson(response, 200, await store.saveCurriculum(user, await readRequest(request, 30 * 1024 * 1024)), cors);
+      }
+      if (url.pathname === '/api/admin/students' && request.method === 'GET') {
+        const user = requireUser(request, response, true);
+        if (!user) return;
+        return sendJson(response, 200, { students: store.listStudents() }, cors);
+      }
+      if (url.pathname === '/api/admin/students' && request.method === 'POST') {
+        const user = requireUser(request, response, true);
+        if (!user) return;
+        const created = await store.createStudent(await readRequest(request, 8_000));
+        return sendJson(response, 201, { student: created }, cors);
+      }
+      if (url.pathname === '/api/admin/students/import' && request.method === 'POST') {
+        const user = requireUser(request, response, true);
+        if (!user) return;
+        const body = await readRequest(request, 2_000_000);
+        const result = await store.createStudentsBatch(body.students);
+        return sendJson(response, 200, result, cors);
+      }
+      const studentMatch = url.pathname.match(/^\/api\/admin\/students\/([a-f0-9-]{36})$/i);
+      if (studentMatch && request.method === 'PATCH') {
+        const user = requireUser(request, response, true);
+        if (!user) return;
+        const updated = await store.updateStudent(studentMatch[1], await readRequest(request, 8_000));
+        revokeUserSessions(studentMatch[1]);
+        return sendJson(response, 200, { student: updated }, cors);
+      }
+      if (studentMatch && request.method === 'DELETE') {
+        const user = requireUser(request, response, true);
+        if (!user) return;
+        const deleted = await store.deleteStudent(studentMatch[1]);
+        revokeUserSessions(studentMatch[1]);
+        return sendJson(response, 200, { student: deleted }, cors);
+      }
+      return sendJson(response, 404, { error: 'API бағыты табылмады.' }, cors);
+    } catch (error) {
+      const status = Number.isInteger(error.status) ? error.status : 500;
+      const message = status >= 500 ? 'Сұрауды өңдеу мүмкін болмады.' : error.message;
+      return sendJson(response, status, { error: message }, cors);
+    }
+  }
+
+  if (request.method !== 'GET' && request.method !== 'HEAD') return sendJson(response, 405, { error: 'GET қажет.' });
+  let pathname;
+  try { pathname = decodeURIComponent(url.pathname); } catch { return sendJson(response, 400, { error: 'URL қате.' }); }
+  if (pathname === '/') pathname = '/index.html';
+  if (pathname.split('/').some(part => part.startsWith('.'))) return sendJson(response, 404, { error: 'Табылмады.' });
+  const file = resolve(root, '.' + pathname);
+  if (file !== root && !file.startsWith(root + sep)) return sendJson(response, 403, { error: 'Тыйым салынған.' });
+  const extension = extname(file).toLowerCase();
+  if (extension === '.mjs') return sendJson(response, 404, { error: 'Табылмады.' });
+  const type = types[extension];
+  if (!type) return sendJson(response, 404, { error: 'Табылмады.' });
+  try { await stat(file); const content = await readFile(file); response.writeHead(200, { 'Content-Type': type, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': pathname.endsWith('.js') || pathname.endsWith('.mjs') ? 'no-cache' : 'no-store' }); response.end(request.method === 'HEAD' ? undefined : content); }
+  catch { sendJson(response, 404, { error: 'Файл табылмады.' }); }
+});
+
+await store.ready;
+const adminConfigured = await store.ensureAdmin(process.env.ADMIN_USERNAME || '', process.env.ADMIN_PASSWORD || '');
+server.listen(port, host, () => console.log('Online Laboratory: http://' + host + ':' + port + ' (AI ' + (process.env.OPENAI_API_KEY ? 'configured' : 'not configured') + ', admin ' + (adminConfigured ? 'configured' : 'not configured') + ')'));
