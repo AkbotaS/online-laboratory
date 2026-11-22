@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+data/
+node_modules/
+.env
+.env.*
+!.env.example
+node_modules/
+data/
+.recovery-backups/
