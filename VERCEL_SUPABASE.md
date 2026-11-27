@@ -1,6 +1,10 @@
 # Vercel + Supabase
 
-The browser UI remains a static deployment on Vercel. All `/api/*` requests are handled by `api/[...path].js`, and the server-side handler uses Supabase PostgREST with a secret server key. The project never calls Supabase directly from browser code.
+The browser UI remains a static deployment on Vercel. The rewrite in `vercel.json` sends all API routes, including `/api/auth/login`, to `api/laboratory.js`. The handler connects to Supabase on the server.
+
+## Preview with existing accounts
+
+Run `npm run preview` and open port 3000. In a fresh checkout, supply the existing database URL and a current secret key through the environment's private server settings. A preview on a trusted computer can also read the existing local `data/learning-analytics` directory. For a private copy in another location, set `ONLINE_LAB_DATA_DIR` to the directory containing `learning-analytics`. The preview uses the stored password hashes and skips admin provisioning.
 
 ## Database schema
 

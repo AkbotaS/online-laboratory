@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/:labRoute*",
+      "destination": "/api/laboratory?labRoute=:labRoute*"
+    }
+  ]
+}

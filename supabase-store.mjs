@@ -1,4 +1,6 @@
-import { mkdir } from 'node:fs/promises';
+import { mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { LearningAnalyticsStore } from './learning-analytics-store.mjs';
 
 const PAGE_SIZE = 1000;
@@ -39,7 +41,7 @@ export class SupabaseLearningAnalyticsStore extends LearningAnalyticsStore {
   constructor(projectRoot) {
     // The parent class supplies the existing assessment and analytics rules.
     // Its filesystem initializer is intentionally disabled in Vercel Functions.
-    super(projectRoot, '/tmp/online-laboratory-supabase');
+    super(projectRoot, tmpdir());
     this.isRemote = true;
     this.supabaseUrl = String(process.env.SUPABASE_URL || '').trim().replace(/\/$/, '');
     this.supabaseKey = String(process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
@@ -47,7 +49,14 @@ export class SupabaseLearningAnalyticsStore extends LearningAnalyticsStore {
     this.ready = filesystemReady.then(() => this.initializeRemote());
   }
 
-  initialize() { return mkdir(this.directory, { recursive: true }); }
+  async initialize() {
+    this.directory = await mkdtemp(join(tmpdir(), 'online-laboratory-'));
+    this.eventsFile = join(this.directory, 'events.ndjson');
+    this.measuresFile = join(this.directory, 'measures.ndjson');
+    this.curriculumFile = join(this.directory, 'curriculum.json');
+    this.settingsFile = join(this.directory, 'settings.json');
+    this.usersFile = join(this.directory, 'users.json');
+  }
 
   async initializeRemote() {
     if (!this.supabaseUrl || !this.supabaseKey) throw new Error('Supabase server credentials are not configured.');

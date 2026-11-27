@@ -8,15 +8,17 @@ import { SupabaseLearningAnalyticsStore } from './supabase-store.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const isVercel = ['1', 'true'].includes(String(process.env.VERCEL || '').toLowerCase());
+const isRender = String(process.env.RENDER || '').toLowerCase() === 'true';
+const isPreview = process.argv.includes('--preview');
 const configuredPort = String(process.env.PORT || '').trim();
-const port = configuredPort ? Number(configuredPort) : 4173;
+const port = configuredPort ? Number(configuredPort) : (isPreview ? 3000 : 4173);
 if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('PORT must be a valid TCP port number.');
-const isHostedRuntime = Boolean(configuredPort) || String(process.env.RENDER || '').toLowerCase() === 'true';
-const host = isHostedRuntime ? '0.0.0.0' : (String(process.env.HOST || '').trim() || '127.0.0.1');
+const host = isRender ? '0.0.0.0' : (String(process.env.HOST || '').trim() || (configuredPort || isPreview ? '0.0.0.0' : '127.0.0.1'));
 const dataDirectory = process.env.ONLINE_LAB_DATA_DIR
   ? resolve(process.env.ONLINE_LAB_DATA_DIR)
-  : (isHostedRuntime ? '/var/data' : '');
-export const store = isVercel ? new SupabaseLearningAnalyticsStore(root) : new LearningAnalyticsStore(root, dataDirectory);
+  : (isRender ? '/var/data' : '');
+const useSupabase = isVercel || Boolean(process.env.SUPABASE_URL || process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY);
+export const store = useSupabase ? new SupabaseLearningAnalyticsStore(root) : new LearningAnalyticsStore(root, dataDirectory);
 // Keep configuration failures inside the API handler so Vercel can return a
 // controlled 503 response instead of failing while importing this module.
 if (isVercel) store.ready.catch(() => undefined);
@@ -262,13 +264,32 @@ export async function handleRequest(request, response) {
   catch { sendJson(response, 404, { error: 'Файл табылмады.' }); }
 }
 
-const server = createServer(handleRequest);
+let requestQueue = Promise.resolve();
+export async function handleDatabaseRequest(request, response) {
+  const run = requestQueue.then(async () => {
+    await store.refresh();
+    await handleRequest(request, response);
+  });
+  requestQueue = run.catch(() => undefined);
+  try {
+    await run;
+  } catch (error) {
+    console.error('Database request failed:', request.method, error?.name || 'Error');
+    if (!response.headersSent) sendJson(response, 503, { error: 'Сервер базасына қосылу мүмкін болмады.' });
+    else if (!response.writableEnded) response.end();
+  }
+}
 
 if (!isVercel) {
   await store.ready;
+  const server = createServer((req, res) => {
+    if (store.isRemote && req.url?.startsWith('/api/')) return handleDatabaseRequest(req, res);
+    return handleRequest(req, res);
+  });
+  if (isPreview && !store.hasAdmin()) throw new Error('Preview needs the existing accounts. Set SUPABASE_URL and SUPABASE_SECRET_KEY as server secrets or point ONLINE_LAB_DATA_DIR at your private data directory.');
   const adminUsername = String(process.env.ADMIN_USERNAME || '').trim();
   const adminPassword = String(process.env.ADMIN_PASSWORD || '');
-  const adminProvisioned = await store.ensureAdmin(adminUsername, adminPassword);
+  const adminProvisioned = (store.isRemote || isPreview) ? store.hasAdmin() : await store.ensureAdmin(adminUsername, adminPassword);
   const adminConfigured = store.hasAdmin();
   if (!adminProvisioned) {
     const issues = [];
