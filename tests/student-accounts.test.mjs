@@ -96,7 +96,7 @@ test('student account lifecycle, isolation, answer-key filtering, and persistenc
   assert.equal(afterRestart.queryAnalytics(admin).summary.sampleSize, 1);
 
   const serverSource = await readFile(new URL('../server.mjs', import.meta.url), 'utf8');
-  assert.match(serverSource, /function requireUser\(request, response, adminOnly = false\)[\s\S]*?if \(user\.mustChangePassword\)[\s\S]*?if \(adminOnly && user\.role !== 'admin'\)/);
+  assert.match(serverSource, /async function requireUser\(request, response, adminOnly = false\)[\s\S]*?if \(user\.mustChangePassword\)[\s\S]*?if \(adminOnly && user\.role !== 'admin'\)/);
   for (const path of ['/api/admin/students', '/api/admin/students/import', '/api/learning/admin']) {
     const routeStart = serverSource.indexOf("url.pathname === '" + path + "'");
     assert.notEqual(routeStart, -1, 'missing protected route: ' + path);

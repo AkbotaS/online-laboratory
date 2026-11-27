@@ -4,8 +4,10 @@ import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handleAssistantRequest, handleMentorEvent } from './assistant-api.mjs';
 import { LearningAnalyticsStore, createSessionToken, hashSessionToken } from './learning-analytics-store.mjs';
+import { SupabaseLearningAnalyticsStore } from './supabase-store.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
+const isVercel = ['1', 'true'].includes(String(process.env.VERCEL || '').toLowerCase());
 const configuredPort = String(process.env.PORT || '').trim();
 const port = configuredPort ? Number(configuredPort) : 4173;
 if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('PORT must be a valid TCP port number.');
@@ -14,7 +16,10 @@ const host = isHostedRuntime ? '0.0.0.0' : (String(process.env.HOST || '').trim(
 const dataDirectory = process.env.ONLINE_LAB_DATA_DIR
   ? resolve(process.env.ONLINE_LAB_DATA_DIR)
   : (isHostedRuntime ? '/var/data' : '');
-const store = new LearningAnalyticsStore(root, dataDirectory);
+export const store = isVercel ? new SupabaseLearningAnalyticsStore(root) : new LearningAnalyticsStore(root, dataDirectory);
+// Keep configuration failures inside the API handler so Vercel can return a
+// controlled 503 response instead of failing while importing this module.
+if (isVercel) store.ready.catch(() => undefined);
 const sessions = new Map();
 const loginWindows = new Map();
 const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon' };
@@ -47,16 +52,25 @@ function sessionCookie(request, token, maxAge) {
   const secure = request.headers['x-forwarded-proto'] === 'https' || Boolean(request.socket.encrypted);
   return 'lab_session=' + encodeURIComponent(token || '') + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=' + maxAge + (secure ? '; Secure' : '');
 }
-function getSessionUser(request) {
+async function getSessionUser(request) {
   const token = parseCookies(request.headers.cookie).lab_session;
   if (!token) return null;
-  const key = hashSessionToken(token), session = sessions.get(key);
-  if (!session || session.expiresAt <= Date.now()) { sessions.delete(key); return null; }
+  const key = hashSessionToken(token), session = store.isRemote ? await store.getSession(key) : sessions.get(key);
+  if (!session || session.expiresAt <= Date.now()) {
+    if (store.isRemote) await store.deleteSession(key); else sessions.delete(key);
+    return null;
+  }
   const user = store.getUser(session.userId);
-  if (!user) { sessions.delete(key); return null; }
+  if (!user) {
+    if (store.isRemote) await store.deleteSession(key); else sessions.delete(key);
+    return null;
+  }
   return { ...user, sessionKey: key };
 }
-function revokeUserSessions(userId) { for (const [key, session] of sessions) if (session.userId === userId) sessions.delete(key); }
+async function revokeUserSessions(userId) {
+  if (store.isRemote) return store.revokeUserSessions(userId);
+  for (const [key, session] of sessions) if (session.userId === userId) sessions.delete(key);
+}
 function loginRateLimited(request) {
   const ip = request.socket.remoteAddress || 'local';
   const now = Date.now(), entry = loginWindows.get(ip) || { start: now, count: 0 };
@@ -72,8 +86,8 @@ async function readRequest(request, maxBytes = 32_000) {
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
   catch { throw Object.assign(new Error('INVALID_JSON'), { status: 400 }); }
 }
-function requireUser(request, response, adminOnly = false) {
-  const user = getSessionUser(request);
+async function requireUser(request, response, adminOnly = false) {
+  const user = await getSessionUser(request);
   if (!user) { sendJson(response, 401, { error: 'Сессия не найдена. Войдите снова.' }, localCorsHeaders(request)); return null; }
   if (user.mustChangePassword) { sendJson(response, 428, { error: 'Перед продолжением смените временный пароль.' }, localCorsHeaders(request)); return null; }
   if (adminOnly && user.role !== 'admin') { sendJson(response, 403, { error: 'Бұл әрекетке әкімші құқығы қажет.' }, localCorsHeaders(request)); return null; }
@@ -81,14 +95,14 @@ function requireUser(request, response, adminOnly = false) {
 }
 function removeSessionCookie(request) { return { 'Set-Cookie': sessionCookie(request, '', 0) }; }
 
-const server = createServer(async (request, response) => {
+export async function handleRequest(request, response) {
   const url = new URL(request.url || '/', 'http://' + (request.headers.host || '127.0.0.1'));
   if (url.pathname.startsWith('/api/')) {
     const cors = localCorsHeaders(request);
     if (!originAllowed(request)) return sendJson(response, 403, { error: 'Origin рұқсат етілмеген.' });
     if (request.method === 'OPTIONS') { response.writeHead(204, cors); return response.end(); }
     try {
-      if (url.pathname === '/api/health' && request.method === 'GET') return sendJson(response, 200, { ok: true, aiConfigured: Boolean(process.env.OPENAI_API_KEY), adminConfigured: store.hasAdmin() }, cors);
+      if (url.pathname === '/api/health' && request.method === 'GET') return sendJson(response, 200, { ok: true, aiConfigured: Boolean(process.env.OPENAI_API_KEY), adminConfigured: store.hasAdmin(), databaseConfigured: store.isRemote ? Boolean(store.isConnected) : true }, cors);
       if (url.pathname === '/api/auth/login' && request.method === 'POST') {
         if (loginRateLimited(request)) return sendJson(response, 429, { error: 'Кіру әрекеттері жиілеп кетті. Бір минуттан соң қайталап көріңіз.' }, cors);
         const body = await readRequest(request, 8_000);
@@ -97,28 +111,33 @@ const server = createServer(async (request, response) => {
         const user = await store.authenticate(username, body.password);
         if (!user) return sendJson(response, 401, { error: 'Логин немесе құпиясөз дұрыс емес.' }, cors);
         const token = createSessionToken(), key = hashSessionToken(token);
-        sessions.set(key, { userId: user.id, expiresAt: Date.now() + SESSION_MS });
+        const expiresAt = Date.now() + SESSION_MS;
+        if (store.isRemote) await store.createSession(key, user.id, expiresAt);
+        else sessions.set(key, { userId: user.id, expiresAt });
         return sendJson(response, 200, { user }, { ...cors, 'Set-Cookie': sessionCookie(request, token, SESSION_MS / 1000) });
       }
       if (url.pathname === '/api/auth/me' && request.method === 'GET') {
-        const user = getSessionUser(request);
+        const user = await getSessionUser(request);
         return user ? sendJson(response, 200, { user: { id: user.id, username: user.username, displayName: user.displayName, role: user.role, groupId: user.groupId, mustChangePassword: Boolean(user.mustChangePassword) } }, cors) : sendJson(response, 401, { error: 'Войти для продолжения нужно.' }, cors);
       }
       if (url.pathname === '/api/auth/change-password' && request.method === 'POST') {
-        const user = getSessionUser(request);
+        const user = await getSessionUser(request);
         if (!user || user.role !== 'student') return sendJson(response, 401, { error: 'Сначала войдите как студент.' }, cors);
         const body = await readRequest(request, 8_000);
         const updated = await store.changeOwnPassword(user.id, body.password);
         return sendJson(response, 200, { user: updated }, cors);
       }
       if (url.pathname === '/api/auth/logout' && request.method === 'POST') {
-        const user = getSessionUser(request);
-        if (user) sessions.delete(user.sessionKey);
+        const token = parseCookies(request.headers.cookie).lab_session;
+        if (token) {
+          const key = hashSessionToken(token);
+          if (store.isRemote) await store.deleteSession(key); else sessions.delete(key);
+        }
         return sendJson(response, 200, { ok: true }, { ...cors, ...removeSessionCookie(request) });
       }
       if (url.pathname === '/api/assistant' || url.pathname === '/api/mentor-event') {
         if (request.method !== 'POST') return sendJson(response, 405, { error: 'POST қажет.' }, cors);
-        const user = requireUser(request, response);
+        const user = await requireUser(request, response);
         if (!user) return;
         const isMentor = url.pathname === '/api/mentor-event';
         const raw = await readRequest(request, isMentor ? 900_000 : 40_000);
@@ -127,7 +146,7 @@ const server = createServer(async (request, response) => {
         response.writeHead(result.status, { ...Object.fromEntries(result.headers), ...cors }); response.end(Buffer.from(await result.arrayBuffer())); return;
       }
       if (url.pathname === '/api/learning/events' && request.method === 'POST') {
-        const user = requireUser(request, response);
+        const user = await requireUser(request, response);
         if (!user) return;
         const body = await readRequest(request, 256_000);
         const batch = Array.isArray(body.events) ? body.events.slice(0, 50) : [body];
@@ -139,22 +158,22 @@ const server = createServer(async (request, response) => {
         return sendJson(response, 200, { results, accepted: results.filter(item => item.accepted).length, duplicates: results.filter(item => item.duplicate).length, rejected: results.filter(item => item.rejected).length }, cors);
       }
       if (url.pathname === '/api/learning/grade' && request.method === 'POST') {
-        const user = requireUser(request, response);
+        const user = await requireUser(request, response);
         if (!user) return;
         return sendJson(response, 200, { result: store.gradeLab(user, await readRequest(request, 64_000)) }, cors);
       }
       if (url.pathname === '/api/learning/quiz-grade' && request.method === 'POST') {
-        const user = requireUser(request, response);
+        const user = await requireUser(request, response);
         if (!user) return;
         return sendJson(response, 200, { result: store.gradeQuiz(user, await readRequest(request, 64_000)) }, cors);
       }
       if (url.pathname === '/api/learning/me' && request.method === 'GET') {
-        const user = requireUser(request, response);
+        const user = await requireUser(request, response);
         if (!user) return;
         return sendJson(response, 200, store.queryAnalytics(user, { labId: url.searchParams.get('labId'), from: url.searchParams.get('from'), to: url.searchParams.get('to'), limit: url.searchParams.get('limit') }), cors);
       }
       if (url.pathname === '/api/learning/admin' && request.method === 'GET') {
-        const user = requireUser(request, response, true);
+        const user = await requireUser(request, response, true);
         if (!user) return;
         return sendJson(response, 200, store.queryAnalytics(user, {
           studentId: url.searchParams.get('studentId'), groupId: url.searchParams.get('groupId'), labId: url.searchParams.get('labId'),
@@ -162,43 +181,43 @@ const server = createServer(async (request, response) => {
         }), cors);
       }
       if (url.pathname === '/api/learning/settings' && request.method === 'GET') {
-        const user = requireUser(request, response);
+        const user = await requireUser(request, response);
         if (!user) return;
         return sendJson(response, 200, store.getSettings(), cors);
       }
       if (url.pathname === '/api/learning/settings' && request.method === 'PATCH') {
-        const user = requireUser(request, response, true);
+        const user = await requireUser(request, response, true);
         if (!user) return;
         return sendJson(response, 200, await store.setRubricWeights(user, await readRequest(request, 8_000)), cors);
       }
       if (url.pathname === '/api/curriculum' && request.method === 'GET') {
-        const user = requireUser(request, response);
+        const user = await requireUser(request, response);
         if (!user) return;
         return sendJson(response, 200, store.getCurriculum(user), cors);
       }
       if (url.pathname === '/api/curriculum/meta' && request.method === 'GET') {
-        const user = requireUser(request, response);
+        const user = await requireUser(request, response);
         if (!user) return;
         return sendJson(response, 200, store.getCurriculumMeta(), cors);
       }
       if (url.pathname === '/api/curriculum' && request.method === 'PUT') {
-        const user = requireUser(request, response, true);
+        const user = await requireUser(request, response, true);
         if (!user) return;
         return sendJson(response, 200, await store.saveCurriculum(user, await readRequest(request, 30 * 1024 * 1024)), cors);
       }
       if (url.pathname === '/api/admin/students' && request.method === 'GET') {
-        const user = requireUser(request, response, true);
+        const user = await requireUser(request, response, true);
         if (!user) return;
         return sendJson(response, 200, { students: store.listStudents() }, cors);
       }
       if (url.pathname === '/api/admin/students' && request.method === 'POST') {
-        const user = requireUser(request, response, true);
+        const user = await requireUser(request, response, true);
         if (!user) return;
         const created = await store.createStudent(await readRequest(request, 8_000));
         return sendJson(response, 201, { student: created }, cors);
       }
       if (url.pathname === '/api/admin/students/import' && request.method === 'POST') {
-        const user = requireUser(request, response, true);
+        const user = await requireUser(request, response, true);
         if (!user) return;
         const body = await readRequest(request, 2_000_000);
         const result = await store.createStudentsBatch(body.students);
@@ -206,17 +225,17 @@ const server = createServer(async (request, response) => {
       }
       const studentMatch = url.pathname.match(/^\/api\/admin\/students\/([a-f0-9-]{36})$/i);
       if (studentMatch && request.method === 'PATCH') {
-        const user = requireUser(request, response, true);
+        const user = await requireUser(request, response, true);
         if (!user) return;
         const updated = await store.updateStudent(studentMatch[1], await readRequest(request, 8_000));
-        revokeUserSessions(studentMatch[1]);
+        await revokeUserSessions(studentMatch[1]);
         return sendJson(response, 200, { student: updated }, cors);
       }
       if (studentMatch && request.method === 'DELETE') {
-        const user = requireUser(request, response, true);
+        const user = await requireUser(request, response, true);
         if (!user) return;
         const deleted = await store.deleteStudent(studentMatch[1]);
-        revokeUserSessions(studentMatch[1]);
+        await revokeUserSessions(studentMatch[1]);
         return sendJson(response, 200, { student: deleted }, cors);
       }
       return sendJson(response, 404, { error: 'API бағыты табылмады.' }, cors);
@@ -241,27 +260,31 @@ const server = createServer(async (request, response) => {
   if (!type) return sendJson(response, 404, { error: 'Табылмады.' });
   try { await stat(file); const content = await readFile(file); response.writeHead(200, { 'Content-Type': type, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': pathname.endsWith('.js') || pathname.endsWith('.mjs') ? 'no-cache' : 'no-store' }); response.end(request.method === 'HEAD' ? undefined : content); }
   catch { sendJson(response, 404, { error: 'Файл табылмады.' }); }
-});
-
-await store.ready;
-const adminUsername = String(process.env.ADMIN_USERNAME || '').trim();
-const adminPassword = String(process.env.ADMIN_PASSWORD || '');
-const adminProvisioned = await store.ensureAdmin(adminUsername, adminPassword);
-const adminConfigured = store.hasAdmin();
-if (!adminProvisioned) {
-  const issues = [];
-  if (!USERNAME_RE.test(adminUsername)) issues.push('ADMIN_USERNAME must be 3–40 ASCII letters, digits, dots, hyphens, or underscores');
-  if (adminPassword.length < 12) issues.push('ADMIN_PASSWORD must contain at least 12 characters');
-  console.warn('Admin environment credentials were not applied. ' + issues.join('; ') + '. Credential values are never logged.');
 }
-server.on('error', error => {
-  console.error('HTTP server failed to listen:', error?.code || 'SERVER_ERROR');
-  process.exitCode = 1;
-});
-server.listen(port, host, () => {
-  const address = server.address();
-  const listeningPort = address && typeof address === 'object' ? address.port : port;
-  console.log('Online Laboratory listening on ' + host + ':' + listeningPort);
-  console.log('Optional AI mentor: ' + (process.env.OPENAI_API_KEY ? 'configured' : 'disabled (OPENAI_API_KEY is optional)'));
-  console.log('Administrator account: ' + (adminConfigured ? 'ready' : 'not configured'));
-});
+
+const server = createServer(handleRequest);
+
+if (!isVercel) {
+  await store.ready;
+  const adminUsername = String(process.env.ADMIN_USERNAME || '').trim();
+  const adminPassword = String(process.env.ADMIN_PASSWORD || '');
+  const adminProvisioned = await store.ensureAdmin(adminUsername, adminPassword);
+  const adminConfigured = store.hasAdmin();
+  if (!adminProvisioned) {
+    const issues = [];
+    if (!USERNAME_RE.test(adminUsername)) issues.push('ADMIN_USERNAME must be 3–40 ASCII letters, digits, dots, hyphens, or underscores');
+    if (adminPassword.length < 12) issues.push('ADMIN_PASSWORD must contain at least 12 characters');
+    console.warn('Admin environment credentials were not applied. ' + issues.join('; ') + '. Credential values are never logged.');
+  }
+  server.on('error', error => {
+    console.error('HTTP server failed to listen:', error?.code || 'SERVER_ERROR');
+    process.exitCode = 1;
+  });
+  server.listen(port, host, () => {
+    const address = server.address();
+    const listeningPort = address && typeof address === 'object' ? address.port : port;
+    console.log('Online Laboratory listening on ' + host + ':' + listeningPort);
+  });
+}
+console.log('Optional AI mentor: ' + (process.env.OPENAI_API_KEY ? 'configured' : 'disabled (OPENAI_API_KEY is optional)'));
+if (!isVercel) console.log('Administrator account: ' + (store.hasAdmin() ? 'ready' : 'not configured'));
